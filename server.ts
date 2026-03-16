@@ -1,0 +1,435 @@
+import { randomUUID } from "crypto";
+import {
+  initStore,
+  getAppState,
+  getKeys,
+  updateSP,
+  setUsers,
+  updateSigning,
+  storeSAMLSession,
+  getSAMLSession,
+  deleteSAMLSession,
+  type User,
+  type SPConfig,
+  type SigningOptions,
+} from "./store";
+import {
+  parseAuthnRequest,
+  generateSAMLResponse,
+  generateIdPMetadata,
+} from "./saml";
+
+const PORT = 3100;
+const BASE_URL = `http://localhost:${PORT}`;
+const ENTITY_ID = BASE_URL;
+const SSO_URL = `${BASE_URL}/sso`;
+
+// ---------------------------------------------------------------------------
+// Boot
+// ---------------------------------------------------------------------------
+const { state, keys } = initStore();
+console.log(`\n🔐 Local SAML IdP starting on ${BASE_URL}\n`);
+
+// ---------------------------------------------------------------------------
+// Client bundle (built once at startup)
+// ---------------------------------------------------------------------------
+let clientBundle: string | null = null;
+let clientBundleError: string | null = null;
+
+async function buildClient() {
+  const result = await Bun.build({
+    entrypoints: ["./client/main.tsx"],
+    bundle: true,
+    format: "esm",
+    target: "browser",
+    define: { "process.env.NODE_ENV": '"development"' },
+  });
+
+  if (!result.success) {
+    clientBundleError = result.logs.map((l) => l.message).join("\n");
+    console.error("Client build failed:", clientBundleError);
+    return;
+  }
+
+  clientBundle = await result.outputs[0].text();
+}
+
+await buildClient();
+
+// ---------------------------------------------------------------------------
+// HTML helpers
+// ---------------------------------------------------------------------------
+function htmlShell(title: string, body: string): Response {
+  return new Response(
+    `<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>${title}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet"/>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Inter',system-ui,sans-serif;background:#f8fafc;color:#1e293b;min-height:100vh}
+</style>
+</head><body>${body}</body></html>`,
+    { headers: { "Content-Type": "text/html" } }
+  );
+}
+
+function loginPage(ctx: string, spName: string, users: User[]): Response {
+  const userCards = users
+    .map(
+      (u) => `
+    <form method="POST" action="/sso/authenticate" style="display:contents">
+      <input type="hidden" name="ctx" value="${escHtml(ctx)}"/>
+      <input type="hidden" name="userId" value="${escHtml(u.id)}"/>
+      <button type="submit" class="user-card">
+        <div class="avatar">${escHtml(u.name[0] ?? "?")}</div>
+        <div class="user-info">
+          <div class="user-name">${escHtml(u.name)}</div>
+          <div class="user-email">${escHtml(u.email)}</div>
+          ${
+            u.attributes.role
+              ? `<span class="role-badge">${escHtml(u.attributes.role)}</span>`
+              : ""
+          }
+        </div>
+        <svg class="arrow" viewBox="0 0 20 20" fill="currentColor" width="20" height="20">
+          <path fill-rule="evenodd" d="M7.293 14.707a1 1 0 010-1.414L10.586 10 7.293 6.707a1 1 0 011.414-1.414l4 4a1 1 0 010 1.414l-4 4a1 1 0 01-1.414 0z" clip-rule="evenodd"/>
+        </svg>
+      </button>
+    </form>`
+    )
+    .join("");
+
+  return htmlShell(
+    "Sign in — Local SAML IdP",
+    `<style>
+.container{max-width:440px;margin:80px auto;padding:0 16px}
+.card{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:32px;box-shadow:0 1px 3px rgba(0,0,0,.06)}
+.logo{display:flex;align-items:center;gap:10px;margin-bottom:24px}
+.logo-icon{width:36px;height:36px;background:linear-gradient(135deg,#6366f1,#8b5cf6);border-radius:8px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:18px}
+.logo-text{font-size:14px;font-weight:600;color:#64748b}
+h1{font-size:22px;font-weight:600;margin-bottom:4px}
+.subtitle{font-size:14px;color:#64748b;margin-bottom:8px}
+.sp-badge{display:inline-flex;align-items:center;gap:6px;background:#f1f5f9;border:1px solid #e2e8f0;border-radius:20px;padding:4px 10px;font-size:12px;color:#475569;margin-bottom:24px}
+.divider{height:1px;background:#f1f5f9;margin:0 -32px 24px}
+.users-label{font-size:12px;font-weight:500;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em;margin-bottom:12px}
+.user-card{display:flex;align-items:center;gap:12px;width:100%;padding:12px 14px;background:#fff;border:1px solid #e2e8f0;border-radius:8px;cursor:pointer;transition:all .15s;margin-bottom:8px;text-align:left}
+.user-card:hover{border-color:#6366f1;background:#fafafe;box-shadow:0 0 0 3px rgba(99,102,241,.08)}
+.avatar{width:38px;height:38px;border-radius:50%;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:600;font-size:16px;flex-shrink:0}
+.user-info{flex:1;min-width:0}
+.user-name{font-weight:500;font-size:14px}
+.user-email{font-size:12px;color:#64748b;margin-top:1px}
+.role-badge{display:inline-block;background:#ede9fe;color:#7c3aed;font-size:11px;padding:1px 7px;border-radius:10px;margin-top:4px;font-weight:500}
+.arrow{color:#cbd5e1;flex-shrink:0}
+.footer{margin-top:20px;text-align:center;font-size:12px;color:#94a3b8}
+.footer a{color:#6366f1;text-decoration:none}
+</style>
+<div class="container">
+  <div class="card">
+    <div class="logo">
+      <div class="logo-icon">🔐</div>
+      <div class="logo-text">Local SAML IdP</div>
+    </div>
+    <h1>Sign in</h1>
+    <p class="subtitle">Choose a test account to continue to</p>
+    <div class="sp-badge">
+      <svg viewBox="0 0 16 16" width="12" height="12" fill="#6366f1"><path d="M8 1a7 7 0 100 14A7 7 0 008 1zM0 8a8 8 0 1116 0A8 8 0 010 8z"/></svg>
+      ${escHtml(spName || "Service Provider")}
+    </div>
+    <div class="divider"></div>
+    <div class="users-label">Test accounts</div>
+    ${userCards}
+    ${users.length === 0 ? '<p style="color:#94a3b8;font-size:14px;text-align:center;padding:16px 0">No test users configured. <a href="/" style="color:#6366f1">Add users →</a></p>' : ""}
+  </div>
+  <div class="footer">
+    <a href="/">← Back to IdP dashboard</a>
+  </div>
+</div>`
+  );
+}
+
+function autoPostForm(acsUrl: string, samlResponse: string, relayState?: string): Response {
+  const relayField = relayState
+    ? `<input type="hidden" name="RelayState" value="${escHtml(relayState)}"/>`
+    : "";
+  return htmlShell(
+    "Redirecting…",
+    `<style>body{display:flex;align-items:center;justify-content:center;height:100vh;background:#f8fafc}</style>
+<div style="text-align:center">
+  <div style="font-size:32px;margin-bottom:16px">🔐</div>
+  <p style="color:#64748b;font-size:14px">Completing authentication…</p>
+</div>
+<form id="f" method="POST" action="${escHtml(acsUrl)}">
+  <input type="hidden" name="SAMLResponse" value="${escHtml(samlResponse)}"/>
+  ${relayField}
+</form>
+<script>document.getElementById('f').submit();</script>`
+  );
+}
+
+function escHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
+Bun.serve({
+  port: PORT,
+
+  async fetch(req) {
+    const url = new URL(req.url);
+    const path = url.pathname;
+    const method = req.method.toUpperCase();
+
+    // ---- Static: client bundle
+    if (path === "/bundle.js") {
+      if (clientBundleError) {
+        return new Response(`// Build error\n// ${clientBundleError}`, {
+          status: 500,
+          headers: { "Content-Type": "application/javascript" },
+        });
+      }
+      return new Response(clientBundle ?? "", {
+        headers: { "Content-Type": "application/javascript" },
+      });
+    }
+
+    // ---- IdP Metadata XML
+    if (path === "/metadata") {
+      const xml = generateIdPMetadata({
+        entityId: ENTITY_ID,
+        ssoUrl: SSO_URL,
+        certificateData: keys.certificateData,
+      });
+      return new Response(xml, {
+        headers: { "Content-Type": "application/xml; charset=utf-8" },
+      });
+    }
+
+    // ---- SAML SSO endpoint (redirect binding AuthnRequest)
+    if (path === "/sso" && method === "GET") {
+      const samlRequestParam = url.searchParams.get("SAMLRequest");
+      if (!samlRequestParam) {
+        return new Response("Missing SAMLRequest parameter", { status: 400 });
+      }
+
+      let parsed;
+      try {
+        parsed = await parseAuthnRequest(samlRequestParam);
+      } catch (e) {
+        return new Response(`Invalid SAMLRequest: ${e}`, { status: 400 });
+      }
+
+      const { state } = { state: getAppState() };
+      const acsUrl =
+        parsed.acsUrl ?? state.sp?.acsUrl ?? "";
+
+      if (!acsUrl) {
+        return new Response(
+          "No ACS URL found in SAMLRequest and no SP configured. Please configure your SP in the dashboard first.",
+          { status: 400 }
+        );
+      }
+
+      const token = randomUUID();
+      storeSAMLSession(token, {
+        id: parsed.id,
+        issuer: parsed.issuer || state.sp?.entityId || "unknown",
+        acsUrl,
+        relayState: url.searchParams.get("RelayState") ?? undefined,
+        createdAt: Date.now(),
+      });
+
+      return Response.redirect(`${BASE_URL}/login?ctx=${token}`, 302);
+    }
+
+    // ---- SAML SSO endpoint (POST binding — less common for AuthnRequests)
+    if (path === "/sso" && method === "POST") {
+      const body = await req.formData();
+      const samlRequestParam = body.get("SAMLRequest")?.toString();
+      if (!samlRequestParam) {
+        return new Response("Missing SAMLRequest", { status: 400 });
+      }
+      // POST binding uses base64 without deflate
+      let xml: string;
+      try {
+        xml = Buffer.from(samlRequestParam, "base64").toString("utf-8");
+      } catch {
+        return new Response("Invalid SAMLRequest encoding", { status: 400 });
+      }
+      const idMatch = xml.match(/\bID="([^"]+)"/);
+      const issuerMatch = xml.match(/<(?:saml:|saml2:)?Issuer[^>]*>([^<]+)<\/(?:saml:|saml2:)?Issuer>/);
+      const acsMatch = xml.match(/AssertionConsumerServiceURL="([^"]+)"/);
+
+      const curState = getAppState();
+      const acsUrl = acsMatch?.[1] ?? curState.sp?.acsUrl ?? "";
+      if (!acsUrl) {
+        return new Response("No ACS URL found", { status: 400 });
+      }
+
+      const token = randomUUID();
+      storeSAMLSession(token, {
+        id: idMatch?.[1] ?? "",
+        issuer: issuerMatch?.[1]?.trim() ?? curState.sp?.entityId ?? "unknown",
+        acsUrl,
+        relayState: body.get("RelayState")?.toString(),
+        createdAt: Date.now(),
+      });
+
+      return Response.redirect(`${BASE_URL}/login?ctx=${token}`, 302);
+    }
+
+    // ---- Login page
+    if (path === "/login" && method === "GET") {
+      const ctx = url.searchParams.get("ctx");
+      if (!ctx) return new Response("Missing ctx", { status: 400 });
+
+      const session = getSAMLSession(ctx);
+      if (!session) {
+        return new Response("Session expired or invalid. Please restart the login flow from your service provider.", {
+          status: 400,
+        });
+      }
+
+      const curState = getAppState();
+      return loginPage(ctx, session.issuer, curState.users);
+    }
+
+    // ---- Authenticate (form submit from login page)
+    if (path === "/sso/authenticate" && method === "POST") {
+      const body = await req.formData();
+      const ctx = body.get("ctx")?.toString();
+      const userId = body.get("userId")?.toString();
+
+      if (!ctx || !userId) {
+        return new Response("Missing ctx or userId", { status: 400 });
+      }
+
+      const session = getSAMLSession(ctx);
+      if (!session) {
+        return new Response("Session expired. Please restart the login flow.", { status: 400 });
+      }
+
+      const curState = getAppState();
+      const user = curState.users.find((u) => u.id === userId);
+      if (!user) {
+        return new Response("User not found", { status: 400 });
+      }
+
+      deleteSAMLSession(ctx);
+
+      let samlResponse: string;
+      try {
+        samlResponse = generateSAMLResponse({
+          inResponseTo: session.id,
+          recipient: session.acsUrl,
+          audience: session.issuer || curState.sp?.entityId || ENTITY_ID,
+          issuer: ENTITY_ID,
+          nameId: user.email,
+          attributes: user.attributes,
+          privateKey: keys.privateKey,
+          certificateData: keys.certificateData,
+          signAssertion: curState.signing.signAssertion,
+          signResponse: curState.signing.signResponse,
+          encryptAssertion: curState.signing.encryptAssertion,
+          spEncryptionCert: curState.sp?.encryptionCert,
+        });
+      } catch (e) {
+        return new Response(`Failed to generate SAML response: ${e}`, { status: 500 });
+      }
+
+      return autoPostForm(session.acsUrl, samlResponse, session.relayState);
+    }
+
+    // ---- API: GET /api/config
+    if (path === "/api/config" && method === "GET") {
+      const curState = getAppState();
+      return Response.json({
+        idp: {
+          entityId: ENTITY_ID,
+          ssoUrl: SSO_URL,
+          metadataUrl: `${BASE_URL}/metadata`,
+          certificate: keys.certificate,
+          certificateData: keys.certificateData,
+        },
+        sp: curState.sp,
+        users: curState.users,
+        signing: curState.signing,
+      });
+    }
+
+    // ---- API: PUT /api/sp
+    if (path === "/api/sp" && method === "PUT") {
+      const body = (await req.json()) as Partial<SPConfig>;
+      if (!body.entityId || !body.acsUrl) {
+        return Response.json({ error: "entityId and acsUrl are required" }, { status: 400 });
+      }
+      updateSP({ entityId: body.entityId, acsUrl: body.acsUrl, loginUrl: body.loginUrl, encryptionCert: body.encryptionCert });
+      return Response.json({ ok: true });
+    }
+
+    // ---- API: PUT /api/signing
+    if (path === "/api/signing" && method === "PUT") {
+      const body = (await req.json()) as Partial<SigningOptions>;
+      if (typeof body.signAssertion !== "boolean" || typeof body.signResponse !== "boolean" || typeof body.encryptAssertion !== "boolean") {
+        return Response.json({ error: "signAssertion, signResponse, and encryptAssertion must be booleans" }, { status: 400 });
+      }
+      updateSigning({ signAssertion: body.signAssertion, signResponse: body.signResponse, encryptAssertion: body.encryptAssertion });
+      return Response.json({ ok: true });
+    }
+
+    // ---- API: DELETE /api/sp
+    if (path === "/api/sp" && method === "DELETE") {
+      updateSP(null);
+      return Response.json({ ok: true });
+    }
+
+    // ---- API: PUT /api/users
+    if (path === "/api/users" && method === "PUT") {
+      const body = (await req.json()) as User[];
+      if (!Array.isArray(body)) {
+        return Response.json({ error: "Expected array" }, { status: 400 });
+      }
+      setUsers(body);
+      return Response.json({ ok: true });
+    }
+
+    // ---- SPA fallback
+    const indexHtml = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Local SAML IdP</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:'Inter',system-ui,sans-serif;background:#f8fafc;color:#1e293b}
+    #root{min-height:100vh}
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="module" src="/bundle.js"></script>
+</body>
+</html>`;
+
+    return new Response(indexHtml, {
+      headers: { "Content-Type": "text/html" },
+    });
+  },
+});
+
+console.log(`✅ Ready at ${BASE_URL}`);
+console.log(`   IdP Entity ID : ${ENTITY_ID}`);
+console.log(`   SSO URL       : ${SSO_URL}`);
+console.log(`   Metadata URL  : ${BASE_URL}/metadata\n`);
