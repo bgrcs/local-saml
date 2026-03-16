@@ -1,6 +1,6 @@
 {
   "name": "local-saml-idp",
-  "version": "1.0.2",
+  "version": "1.0.4",
   "description": "Local SAML 2.0 IdP emulator for development testing",
   "type": "module",
   "bin": {
@@ -14,7 +14,7 @@
   "scripts": {
     "start": "bun run server.ts",
     "dev": "bun --watch server.ts",
-    "build": "NODE_ENV=production bun build ./client/main.tsx --outfile ./dist/bundle.js --bundle --target browser --jsx-import-source react",
+    "build": "NODE_ENV=production bun build ./client/main.tsx --outfile ./dist/bundle.js --bundle --target browser --jsx-import-source react && bun scripts/generate-bundle-module.ts",
     "compile": "mkdir -p binaries && bun build --compile --target=bun-linux-x64 ./server.ts --outfile ./binaries/local-saml-linux-x64 && bun build --compile --target=bun-linux-arm64 ./server.ts --outfile ./binaries/local-saml-linux-arm64 && bun build --compile --target=bun-darwin-x64 ./server.ts --outfile ./binaries/local-saml-darwin-x64 && bun build --compile --target=bun-darwin-arm64 ./server.ts --outfile ./binaries/local-saml-darwin-arm64 && bun build --compile --target=bun-windows-x64 ./server.ts --outfile ./binaries/local-saml-windows-x64.exe",
     "prepublishOnly": "bun run build && bun run compile"
   },
