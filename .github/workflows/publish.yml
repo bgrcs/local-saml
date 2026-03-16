@@ -1,0 +1,45 @@
+name: Publish to npm
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build client bundle
+        run: bun run build
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Publish if version changed
+        run: |
+          PACKAGE=$(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync('./package.json','utf8')).name)")
+          CURRENT=$(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync('./package.json','utf8')).version)")
+          PUBLISHED=$(npm view "$PACKAGE" version 2>/dev/null || echo "unpublished")
+
+          if [ "$CURRENT" = "$PUBLISHED" ]; then
+            echo "Version $CURRENT is already on npm — bump package.json to release."
+          else
+            echo "Publishing $PACKAGE@$CURRENT..."
+            npm publish --access public
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -2,7 +2,7 @@ import { mkdirSync, existsSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import { generateKeys, type SAMLKeys } from "./saml";
 
-const DATA_DIR = join(import.meta.dir, "data");
+const DATA_DIR = join(process.cwd(), "data");
 mkdirSync(DATA_DIR, { recursive: true });
 
 export interface User {

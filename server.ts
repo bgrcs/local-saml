@@ -1,4 +1,6 @@
 import { randomUUID } from "crypto";
+import { existsSync, readFileSync } from "fs";
+import { join } from "path";
 import {
   initStore,
   getAppState,
@@ -37,8 +39,16 @@ let clientBundle: string | null = null;
 let clientBundleError: string | null = null;
 
 async function buildClient() {
+  // When installed as an npm package the pre-built bundle lives next to server.ts
+  const prebuilt = join(import.meta.dir, "dist", "bundle.js");
+  if (existsSync(prebuilt)) {
+    clientBundle = readFileSync(prebuilt, "utf-8");
+    return;
+  }
+
+  // Development mode: build from source
   const result = await Bun.build({
-    entrypoints: ["./client/main.tsx"],
+    entrypoints: [join(import.meta.dir, "client/main.tsx")],
     bundle: true,
     format: "esm",
     target: "browser",
