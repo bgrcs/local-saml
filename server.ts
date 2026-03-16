@@ -1,5 +1,4 @@
 import { randomUUID } from "crypto";
-import { existsSync, readFileSync } from "fs";
 import { join } from "path";
 import {
   initStore,
@@ -39,10 +38,10 @@ let clientBundle: string | null = null;
 let clientBundleError: string | null = null;
 
 async function buildClient() {
-  // When installed as an npm package the pre-built bundle lives next to server.ts
-  const prebuilt = join(import.meta.dir, "dist", "bundle.js");
-  if (existsSync(prebuilt)) {
-    clientBundle = readFileSync(prebuilt, "utf-8");
+  // Compiled binary / npm install: dist/bundle.js is embedded via new URL() asset embedding
+  const bundleFile = Bun.file(new URL("./dist/bundle.js", import.meta.url));
+  if (await bundleFile.exists()) {
+    clientBundle = await bundleFile.text();
     return;
   }
 

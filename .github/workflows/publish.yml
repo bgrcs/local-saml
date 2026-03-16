@@ -24,6 +24,9 @@ jobs:
       - name: Build client bundle
         run: bun run build
 
+      - name: Compile binaries for all platforms
+        run: bun run compile
+
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -39,7 +42,7 @@ jobs:
             echo "Version $CURRENT is already on npm — bump package.json to release."
           else
             echo "Publishing $PACKAGE@$CURRENT..."
-            npm publish --access public
+            npm publish --access public --ignore-scripts
           fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
